@@ -1,213 +1,200 @@
 """
 Lab 11 — Part 2B: Output Guardrails
   TODO 6: Content filter (PII, secrets)
-  TODO 7: LLM-as-Judge safety check
+  TODO 7: LLM-as-Judge
   TODO 8: Output Guardrail Plugin (ADK)
 """
 import re
-import textwrap
+import asyncio
 
+from google import genai
 from google.genai import types
-from google.adk.agents import llm_agent
-from google.adk import runners
 from google.adk.plugins import base_plugin
-
-from core.utils import chat_with_agent
+from google.adk.agents.invocation_context import InvocationContext
 
 
 # ============================================================
-# TODO 6: Implement content_filter()
-#
-# Check if the response contains PII (personal info), API keys,
-# passwords, or inappropriate content.
-#
-# Return a dict with:
-# - "safe": True/False
-# - "issues": list of problems found
-# - "redacted": cleaned response (PII replaced with [REDACTED])
+# TODO 6: Content filter
 # ============================================================
 
-def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+def contains_bad_content(text: str) -> bool:
+    """Detect harmful content in response."""
+    bad_words = ["hack", "bomb", "kill", "exploit"]
+    text_lower = text.lower()
+    return any(word in text_lower for word in bad_words)
 
-    Args:
-        response: The LLM's response text
+def contains_sensitive_info(text: str) -> bool:
+    """Detect leakage of passwords, API keys, internal systems, database info."""
+    sensitive_patterns = [
+        r"password\s*[:=]\s*\S+",
+        r"sk-[a-zA-Z0-9-]+",
+        r"internal",
+        r"database",
+        r"db\."
+    ]
+    return any(re.search(p, text, re.IGNORECASE) for p in sensitive_patterns)
 
-    Returns:
-        dict with 'safe', 'issues', and 'redacted' keys
+def contains_pii(text: str) -> bool:
+    """Detect phone numbers and emails."""
+    pii_patterns = [
+        r"\b\d{9,11}\b",
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+    ]
+    return any(re.search(p, text) for p in pii_patterns)
+
+def redact_sensitive(text: str) -> str:
+    """Replace sensitive data with [REDACTED]."""
+    patterns_to_redact = [
+        r"\b\d{9,11}\b",
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        r"(password\s*[:=]\s*\S+)",
+        r"(sk-[a-zA-Z0-9-]+)"
+    ]
+    redacted_text = text
+    for pattern in patterns_to_redact:
+        redacted_text = re.sub(pattern, "[REDACTED]", redacted_text, flags=re.IGNORECASE)
+    return redacted_text
+
+def check_output(text: str) -> tuple[bool, str]:
+    """Block harmful or sensitive outputs, redact PII if needed.
+    Returns: (is_safe, processed_message)
     """
-    issues = []
-    redacted = response
-
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
-
-    return {
-        "safe": len(issues) == 0,
-        "issues": issues,
-        "redacted": redacted,
-    }
+    if contains_bad_content(text):
+        return False, "Blocked: Harmful or unsafe content detected."
+        
+    if contains_sensitive_info(text):
+        return False, "Blocked: Sensitive information leakage detected."
+        
+    if contains_pii(text):
+        # We allow it, but redact it
+        return True, redact_sensitive(text)
+        
+    return True, text
 
 
 # ============================================================
-# TODO 7: Implement LLM-as-Judge
-#
-# Create a separate agent (judge) to check response safety.
-# The judge classifies responses as SAFE or UNSAFE.
-#
-# KEY: The judge's instruction must NOT contain {placeholders}
-# because ADK treats them as context variables.
-# Instead, pass the content to evaluate as the user message.
+# TODO 7: LLM-as-Judge
 # ============================================================
 
-SAFETY_JUDGE_INSTRUCTION = """You are a safety classifier for an AI banking assistant.
-Your job is to determine if a given AI response is safe to send to customers.
-
-When you receive a message, treat it as the AI response to evaluate.
-
-Check for:
-1. Leaked internal information (passwords, API keys, database details)
-2. Harmful or inappropriate content
-3. Instructions that could harm the user
-4. Fabricated information presented as fact (hallucination)
-5. Off-topic responses not related to banking
-
-Respond with ONLY one word: SAFE or UNSAFE
-If UNSAFE, add a brief reason on the next line.
-"""
-
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-2.0-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
-
-safety_judge_agent = None  # TODO: Replace with implementation
-judge_runner = None
-
+_judge_client = None
 
 def _init_judge():
-    """Initialize the judge agent and runner (call after creating the agent)."""
-    global judge_runner
-    if safety_judge_agent is not None:
-        judge_runner = runners.InMemoryRunner(
-            agent=safety_judge_agent, app_name="safety_judge"
-        )
+    """Initialize the AI judge client."""
+    global _judge_client
+    if _judge_client is None:
+        _judge_client = genai.Client()
 
-
-async def llm_safety_check(response_text: str) -> dict:
-    """Use LLM judge to check if response is safe.
-
-    Args:
-        response_text: The agent's response to evaluate
-
+def llm_as_judge(text: str) -> bool:
+    """Use Gemini to evaluate if the response text is safe.
+    
     Returns:
-        dict with 'safe' (bool) and 'verdict' (str)
+        True if safe, False if unsafe
     """
-    if safety_judge_agent is None or judge_runner is None:
-        return {"safe": True, "verdict": "Judge not initialized — skipping"}
+    if _judge_client is None:
+        _init_judge()
+        
+    JUDGE_PROMPT = f"""You are a security AI judge. Evaluate the following text.
+If it contains passwords, API keys, internal system architectures, database URLs or any malicious content, respond exactly with 'UNSAFE'.
+Otherwise, respond exactly with 'SAFE'.
 
-    prompt = f"Evaluate this AI response for safety:\n\n{response_text}"
-    verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
-    is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
-    return {"safe": is_safe, "verdict": verdict.strip()}
+Text to evaluate: {text}"""
+
+    try:
+        response = _judge_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=JUDGE_PROMPT,
+        )
+        verdict = response.text.strip().upper()
+        return verdict == "SAFE"
+    except Exception as e:
+        print(f"LLM Judge error: {e}")
+        # Default to False (fail-closed) if judge fails
+        return False
 
 
 # ============================================================
-# TODO 8: Implement OutputGuardrailPlugin
-#
-# This plugin checks the agent's output BEFORE sending to the user.
-# Uses after_model_callback to intercept LLM responses.
-# Combines content_filter() and llm_safety_check().
-#
-# NOTE: after_model_callback uses keyword-only arguments.
-#   - llm_response has a .content attribute (types.Content)
-#   - Return the (possibly modified) llm_response, or None to keep original
+# TODO 8: Output Guardrail Plugin
 # ============================================================
 
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
-    """Plugin that checks agent output before sending to user."""
-
-    def __init__(self, use_llm_judge=True):
+    """Plugin that processes model outputs before returning to user."""
+    
+    def __init__(self, use_llm_judge=False):
         super().__init__(name="output_guardrail")
-        self.use_llm_judge = use_llm_judge and (safety_judge_agent is not None)
+        self.use_llm_judge = use_llm_judge
         self.blocked_count = 0
-        self.redacted_count = 0
-        self.total_count = 0
 
-    def _extract_text(self, llm_response) -> str:
-        """Extract text from LLM response."""
+    def _extract_text(self, content: types.Content) -> str:
+        """Extract plain text from a Content object."""
         text = ""
-        if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
+        if content and content.parts:
+            for part in content.parts:
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
 
-    async def after_model_callback(
+    async def on_model_response_callback(
         self,
         *,
-        callback_context,
-        llm_response,
-    ):
-        """Check LLM response before sending to user."""
-        self.total_count += 1
+        invocation_context: InvocationContext,
+        model_response: types.Content,
+    ) -> types.Content | None:
+        """Process model response before it is sent to the user.
+        
+        Returns:
+            None if message is perfectly fine (let pass).
+            types.Content if we want to modify/block it.
+        """
+        text = self._extract_text(model_response)
+        
+        # 1. Rule-based check
+        is_safe, processed_str = check_output(text)
+        
+        # 2. LLM Judge check (if enabled)
+        if is_safe and self.use_llm_judge:
+            llm_safe = llm_as_judge(processed_str)
+            if not llm_safe:
+                is_safe = False
+                processed_str = "Blocked: Response was rejected by AI Safety Judge."
+                
+        if not is_safe:
+            self.blocked_count += 1
+            return types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=processed_str)]
+            )
+            
+        # If safe but modified (redacted PII)
+        if is_safe and processed_str != text:
+             return types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=processed_str)]
+            )
 
-        response_text = self._extract_text(llm_response)
-        if not response_text:
-            return llm_response
-
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
-
-        return llm_response  # TODO: modify if needed
-
+        # Nothing changed
+        return None
 
 # ============================================================
-# Quick tests
+# Quick test
 # ============================================================
 
 def test_content_filter():
-    """Test content_filter with sample responses."""
-    test_responses = [
-        "The 12-month savings rate is 5.5% per year.",
-        "Admin password is admin123, API key is sk-vinbank-secret-2024.",
-        "Contact us at 0901234567 or email test@vinbank.com for details.",
+    """Test functionality of output guardrails."""
+    print("Testing output guardrails (content filter)...")
+    
+    test_cases = [
+        "Welcome to Vinbank! How can I help?",
+        "The system internal database is at db.vinbank.internal:5432.",
+        "Your new password is: admin123",
+        "Please call 0123456789 for more details.",
+        "How to hack a bank?"
     ]
-    print("Testing content_filter():")
-    for resp in test_responses:
-        result = content_filter(resp)
-        status = "SAFE" if result["safe"] else "ISSUES FOUND"
-        print(f"  [{status}] '{resp[:60]}...'")
-        if result["issues"]:
-            print(f"           Issues: {result['issues']}")
-            print(f"           Redacted: {result['redacted'][:80]}...")
-
+    
+    for i, text in enumerate(test_cases, 1):
+        safe, result = check_output(text)
+        status = "PASSED/REDACTED" if safe else "BLOCKED"
+        print(f"  {i}. [{status}] Original: {text}")
+        print(f"     -> Result: {result}")
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
     test_content_filter()
